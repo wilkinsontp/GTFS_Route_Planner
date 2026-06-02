@@ -28,6 +28,7 @@ from routing import (
     Connection, Footpaths, Journey, Leg,
     compute_footpaths, load_connections, plan_journey, stops_near,
 )
+from rt_merge import merge_rt
 from rt_store import start_rt_poller, store as rt_store
 
 # ---------------------------------------------------------------------------
@@ -238,9 +239,12 @@ def journey(req: JourneyRequest):
         raise HTTPException(
             404,
             f"No journey found between the given coordinates for "
-            f"{today} departing after {_fmt_time(depart_sec)}. "
+            f"{journey_date} departing after {_fmt_time(depart_sec)}. "
             "Try a later departure time or wider search radius.",
         )
+
+    # Apply RT delays and collect warnings
+    journey_result, rt_warnings = merge_rt(journey_result, rt_store, db)
 
     return JourneyOut(
         legs=[_leg_to_out(leg) for leg in journey_result.legs],
@@ -251,7 +255,7 @@ def journey(req: JourneyRequest):
         destination_stop=chosen_dest[0],
         destination_stop_name=chosen_dest[1],
         rt_age_seconds=round(rt_store.age_seconds(), 1),
-        warnings=[],  # filled in Step 7
+        warnings=rt_warnings,
     )
 
 

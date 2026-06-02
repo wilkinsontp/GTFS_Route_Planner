@@ -246,20 +246,78 @@ and `rt_age_seconds` indicator in-place without a full page reload.
 
 ## Build Order
 
-Build in this sequence — do not skip ahead:
+✅ = complete and tested against live data.
 
-1. **GTFS ingester** — download ZIP, parse CSVs, load into SQLite with correct indexes
-2. **Calendar resolver** — active service_id set for today's date
-3. **Static journey planner** — CSA engine against SQLite, no RT
-4. **FastAPI wrapper** — `/journey` endpoint working against static data
-5. **RTStore + background poller** — 30s poll, graceful degradation if feed unavailable
-6. **RT merge layer** — patch delays into journey results, `rt_age_seconds` field
-7. **Static diff / warning system** — diff on feed update, per-trip warnings in results
-8. **Frontend** — Leaflet map, journey UI, refresh button
-9. **Analytics layer** — GeoPandas density + gap analysis, GeoJSON output
+1. ✅ **GTFS ingester** (`ingester.py`) — download ZIP, parse CSVs, load into SQLite with correct indexes
+2. ✅ **Calendar resolver** (`calendar_resolver.py`) — active service_id set for today's date
+3. ✅ **Static journey planner** (`routing.py`) — CSA engine against SQLite, no RT
+4. ✅ **FastAPI wrapper** (`main.py`) — `/journey` endpoint working against static data
+5. ✅ **RTStore + background poller** (`rt_store.py`) — 30s poll, graceful degradation if feed unavailable
+6. ✅ **RT merge layer** (`rt_merge.py`) — patch delays into journey results, `rt_age_seconds` field
+7. **Static diff / warning system** (`diff.py`) — diff on feed update, per-trip warnings in results
+8. **Frontend** (`static/`) — Leaflet map, journey UI, refresh button
+9. **Analytics layer** (`analytics.py`) — GeoPandas density + gap analysis, GeoJSON output
 
 Steps 1–4 can be built and tested with no network access to RT endpoints.
 Steps 5–7 require the RT feeds to be accessible (they are open, no auth needed).
+
+---
+
+## Implementation Notes (decisions made during build)
+
+### Routing engine — CSA with footpaths
+
+The CSA implementation in `routing.py` extends the standard algorithm with
+a **footpath table** pre-computed at startup from stop lat/lon coordinates:
+
+- `compute_footpaths(conn)` uses a grid-cell spatial index to find all stop
+  pairs within `MAX_WALK_TRANSFER_M` (400 m default), then converts distance
+  to walk seconds via `WALK_SPEED_MS` (1.2 m/s) + `WALK_BOARDING_BUFFER_S`
+  (30 s). Builds 85k edges across 12,850 stops in ~0.45 s.
+- Walk edges are propagated in the CSA scan: when a stop is newly reached
+  by transit, all walkable neighbours are immediately updated in `earliest[]`.
+- Walk legs appear explicitly in the journey result (route_type = -1,
+  `walk_distance_m` field set) so the frontend can render them correctly.
+
+**Transfer penalty rules** (in `_csa_raw`):
+
+| Situation | Penalty |
+|---|---|
+| Continuing on the same boarded trip | None |
+| Boarding at origin or a walked-to stop | None (walk time IS the transfer cost) |
+| Changing vehicles at a transit-arrived stop | `MIN_TRANSFER_SECONDS` (120 s) |
+
+This correctly models Brisbane's South East Busway: same-platform rapid
+interchanges get a 2-minute minimum, while cross-platform or inter-stop
+transfers (e.g. UQ Lakes stop A → stop D, ~62 m / 81 s) are modelled from
+the actual physical distance.
+
+### RT merge layer
+
+`rt_merge.merge_rt(journey, rt_store, conn)` looks up each transit leg's
+board and alight `stop_sequence` from SQLite, then reads the per-stop delay
+from `RTStore.trip_updates[trip_id]["stop_delays"]`, falling back to the
+trip-level delay if the specific stop has no entry.  Walk legs are skipped.
+Cancellations (schedule_relationship == 3) generate a warning string.
+Delays ≥ 5 minutes generate a warning string.  The function returns the
+mutated journey and a list of warning strings; the original scheduled times
+are preserved alongside the RT-adjusted times.
+
+### API endpoints — current state
+
+| Endpoint | Status | Notes |
+|---|---|---|
+| `POST /journey` | ✅ live | RT delays merged, walk legs included, warnings returned |
+| `GET /health` | ✅ live | DB age, RT age, trip/vehicle/alert counts |
+| `GET /alerts` | ❌ not yet | Planned Step 7/8 |
+| `GET /vehicles` | ❌ not yet | Planned Step 8 |
+| `POST /refresh` | ❌ not yet | Planned Step 8 |
+
+### Known missing features (planned)
+
+- `arrive_before` journey planning (CSA currently only supports `depart_after`)
+- `min_legs` / `max_legs` parameters
+- Multi-leg optimisation (RAPTOR) for round-based transfers
 
 ---
 
