@@ -1,12 +1,7 @@
-"""Step 4 — FastAPI application.
+"""FastAPI application — all steps wired together.
 
-Startup sequence:
-  1. Open existing SQLite immediately (serves requests right away).
-  2. Check DB age; if stale, spawn background ingester thread.
-  3. Pre-load connection list for today into memory.
-  4. Serve /journey and static frontend files.
-
-RT poller and merge layer are wired in Steps 5–6.
+Startup: open SQLite → load connections + footpaths → start RT poller →
+         spawn background ingester check → serve requests.
 """
 
 import sqlite3
@@ -16,8 +11,9 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime
 from typing import Optional
 
+import requests as _requests
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -28,6 +24,7 @@ from routing import (
     Connection, Footpaths, Journey, Leg,
     compute_footpaths, load_connections, plan_journey, stops_near,
 )
+import diff as diff_mod
 from rt_merge import merge_rt
 from rt_store import start_rt_poller, store as rt_store
 
@@ -40,6 +37,7 @@ _connections: list[Connection] = []
 _connections_date: Optional[date] = None
 _footpaths: Footpaths = {}
 _conn_lock = threading.Lock()
+_last_journey_req: Optional["JourneyRequest"] = None
 
 
 def _get_db() -> sqlite3.Connection:
@@ -200,6 +198,8 @@ def _leg_to_out(leg: Leg) -> LegOut:
 
 @app.post("/journey", response_model=JourneyOut)
 def journey(req: JourneyRequest):
+    global _last_journey_req
+    _last_journey_req = req
     db = _get_db()
 
     if req.depart_after:
@@ -246,6 +246,10 @@ def journey(req: JourneyRequest):
     # Apply RT delays and collect warnings
     journey_result, rt_warnings = merge_rt(journey_result, rt_store, db)
 
+    # Add any static schedule-change warnings from the last feed diff
+    trip_ids = [l.trip_id for l in journey_result.legs if l.route_type != -1]
+    diff_warnings = diff_mod.check_warnings(trip_ids)
+
     return JourneyOut(
         legs=[_leg_to_out(leg) for leg in journey_result.legs],
         total_minutes=journey_result.total_time // 60,
@@ -255,7 +259,7 @@ def journey(req: JourneyRequest):
         destination_stop=chosen_dest[0],
         destination_stop_name=chosen_dest[1],
         rt_age_seconds=round(rt_store.age_seconds(), 1),
-        warnings=rt_warnings,
+        warnings=rt_warnings + diff_warnings,
     )
 
 
@@ -274,8 +278,73 @@ def health():
     }
 
 
+@app.get("/alerts")
+def alerts():
+    snap = rt_store.snapshot()
+    return {
+        "alerts": snap["alerts"],
+        "count": len(snap["alerts"]),
+        "rt_age_seconds": round(rt_store.age_seconds(), 1),
+    }
+
+
+@app.get("/vehicles")
+def vehicles():
+    snap = rt_store.snapshot()
+    return {
+        "vehicles": list(snap["vehicle_positions"].values()),
+        "count": len(snap["vehicle_positions"]),
+        "rt_age_seconds": round(rt_store.age_seconds(), 1),
+    }
+
+
+@app.post("/refresh")
+def refresh():
+    """Immediately re-poll all RT feeds, then re-run the last journey query."""
+    from rt_store import _poll_once
+    _poll_once(rt_store)
+    if _last_journey_req is not None:
+        return journey(_last_journey_req)
+    return {"status": "ok", "rt_age_seconds": round(rt_store.age_seconds(), 1)}
+
+
+@app.get("/geocode")
+def geocode(q: str = Query(..., min_length=3)):
+    """Proxy to Nominatim — returns up to 5 candidate locations."""
+    try:
+        r = _requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": q, "format": "json", "countrycodes": "au", "limit": 5,
+                    "addressdetails": 0},
+            headers={"User-Agent": "Translink-Journey-Planner/1.0 (local)"},
+            timeout=8,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        raise HTTPException(502, f"Geocoding service unavailable: {exc}")
+
+
+@app.get("/analytics/density")
+def analytics_density():
+    geojson_path = config.STATIC_DIR / "data" / "density.geojson"
+    if not geojson_path.exists():
+        raise HTTPException(404, "Density GeoJSON not yet generated. Run: py analytics.py")
+    import json
+    return json.loads(geojson_path.read_text())
+
+
+@app.get("/analytics/gaps")
+def analytics_gaps():
+    geojson_path = config.STATIC_DIR / "data" / "gaps.geojson"
+    if not geojson_path.exists():
+        raise HTTPException(404, "Gaps GeoJSON not yet generated. Run: py analytics.py")
+    import json
+    return json.loads(geojson_path.read_text())
+
+
 # ---------------------------------------------------------------------------
-# Static frontend files (Step 8 — served when present)
+# Static frontend files
 # ---------------------------------------------------------------------------
 
 if config.STATIC_DIR.exists():

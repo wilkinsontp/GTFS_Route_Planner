@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SEQ Analytics</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    body { overflow: hidden; }
+    #map { height: calc(100vh - 52px); }
+    #controls {
+      position: absolute; top: 62px; left: 10px; z-index: 500;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; padding: 1rem; width: 220px;
+    }
+    .layer-btn { display: block; width: 100%; margin-bottom: 0.5rem;
+      padding: 0.5rem 0.75rem; border-radius: 6px; cursor: pointer; font-size: 0.85rem;
+      border: 1px solid var(--border); background: var(--surface2); color: var(--muted); text-align: left; }
+    .layer-btn.active { border-color: var(--accent); color: var(--text); background: var(--accent-dim); }
+    .legend-scale { display: flex; height: 8px; border-radius: 4px; margin: 0.5rem 0; overflow:hidden; }
+    .legend-labels { display: flex; justify-content: space-between; font-size: 0.7rem; color: var(--muted); }
+    #statusMsg { font-size: 0.75rem; color: var(--muted); margin-top: 0.75rem; }
+  </style>
+</head>
+<body>
+
+<nav>
+  <span class="logo">SEQ Transit</span>
+  <a href="/">Journey</a>
+  <a href="/map.html">Live Map</a>
+  <a href="/analytics.html" class="active">Analytics</a>
+  <span class="rt-badge"><span class="rt-dot"></span><span>Static data</span></span>
+</nav>
+
+<div id="map"></div>
+
+<div id="controls">
+  <div class="card-title">Overlay</div>
+  <button class="layer-btn active" id="btnDensity" onclick="showLayer('density')">
+    🔥 Service density
+  </button>
+  <button class="layer-btn" id="btnGaps" onclick="showLayer('gaps')">
+    ⬜ Coverage gaps
+  </button>
+
+  <div id="legendWrap" style="margin-top:0.75rem">
+    <div class="legend-scale" id="legendScale"></div>
+    <div class="legend-labels"><span id="legendLow"></span><span id="legendHigh"></span></div>
+  </div>
+
+  <div id="statusMsg">Loading…</div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map = L.map('map').setView([-27.47, 153.02], 10);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '© OpenStreetMap contributors', maxZoom: 19, opacity: 0.6
+}).addTo(map);
+
+let currentLayer = null;
+let activeMode = 'density';
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+function toHex(r, g, b) {
+  return '#' + [r,g,b].map(x => Math.round(x).toString(16).padStart(2,'0')).join('');
+}
+
+function densityColor(intensity) {
+  // Black → blue → cyan → yellow → red
+  if (intensity < 0.25) {
+    const t = intensity / 0.25;
+    return toHex(lerp(15,0,t), lerp(17,100,t), lerp(23,220,t));
+  } else if (intensity < 0.5) {
+    const t = (intensity-0.25)/0.25;
+    return toHex(lerp(0,0,t), lerp(100,220,t), lerp(220,180,t));
+  } else if (intensity < 0.75) {
+    const t = (intensity-0.5)/0.25;
+    return toHex(lerp(0,255,t), lerp(220,220,t), lerp(180,0,t));
+  } else {
+    const t = (intensity-0.75)/0.25;
+    return toHex(lerp(255,220,t), lerp(220,30,t), lerp(0,0,t));
+  }
+}
+
+async function showLayer(mode) {
+  activeMode = mode;
+  document.getElementById('btnDensity').classList.toggle('active', mode==='density');
+  document.getElementById('btnGaps').classList.toggle('active', mode==='gaps');
+
+  if (currentLayer) { map.removeLayer(currentLayer); currentLayer = null; }
+  document.getElementById('statusMsg').textContent = 'Loading…';
+
+  const endpoint = mode === 'density' ? '/analytics/density' : '/analytics/gaps';
+  try {
+    const res = await fetch(endpoint);
+    if (!res.ok) { document.getElementById('statusMsg').textContent = await res.text(); return; }
+    const geojson = await res.json();
+
+    if (mode === 'density') {
+      currentLayer = L.geoJSON(geojson, {
+        style: f => ({
+          fillColor: densityColor(f.properties.intensity),
+          fillOpacity: 0.7,
+          color: 'none', weight: 0,
+        }),
+        onEachFeature: (f, layer) => {
+          layer.bindTooltip(`${f.properties.count.toLocaleString()} departures`);
+        }
+      }).addTo(map);
+
+      // Legend
+      const stops = 12;
+      document.getElementById('legendScale').innerHTML =
+        Array.from({length:stops}, (_,i) =>
+          `<div style="flex:1;background:${densityColor(i/(stops-1))}"></div>`).join('');
+      document.getElementById('legendLow').textContent  = 'Low';
+      document.getElementById('legendHigh').textContent = 'High';
+    } else {
+      currentLayer = L.geoJSON(geojson, {
+        style: f => ({
+          fillColor: '#ef4444', fillOpacity: 0.35,
+          color: 'none', weight: 0,
+        }),
+        onEachFeature: (f, layer) => {
+          const d = f.properties.nearest_stop_m;
+          layer.bindTooltip(d ? `${Math.round(d)}m to nearest stop` : 'No stop found');
+        }
+      }).addTo(map);
+
+      document.getElementById('legendScale').innerHTML =
+        `<div style="flex:1;background:#ef4444;opacity:.35"></div>`;
+      document.getElementById('legendLow').textContent  = 'No stop within 800m';
+      document.getElementById('legendHigh').textContent = '';
+    }
+
+    const count = geojson.features.length;
+    document.getElementById('statusMsg').textContent =
+      `${count.toLocaleString()} cells displayed`;
+  } catch(e) {
+    document.getElementById('statusMsg').textContent = 'Failed to load overlay.';
+  }
+}
+
+showLayer('density');
+</script>
+</body>
+</html>

@@ -18,6 +18,7 @@ from typing import Callable, Optional
 import requests
 
 import config
+import diff as diff_mod
 
 logging.basicConfig(
     format="%(asctime)s [ingester] %(message)s",
@@ -364,11 +365,32 @@ def ingest(force: bool = False) -> None:
         except sqlite3.Error:
             pass  # Corrupt or missing metadata → fall through to fresh download
 
+    # Snapshot old feed before refresh (for diff warnings)
+    old_snap: dict = {}
+    if db_path.exists():
+        try:
+            old_conn = sqlite3.connect(db_path)
+            old_snap = diff_mod.snapshot_trips(old_conn)
+            old_conn.close()
+            log.info("Snapshotted %d trips from existing feed for diff.", len(old_snap))
+        except Exception as exc:
+            log.warning("Could not snapshot old feed: %s", exc)
+
     t0 = time.time()
     zip_bytes = _download_zip(config.GTFS_STATIC_URL)
     log.info("Parsing GTFS and loading SQLite…")
     _build_db(zip_bytes, db_path)
     log.info("Ingestion complete in %.1f s", time.time() - t0)
+
+    # Diff new feed against snapshot and store per-trip warnings
+    if old_snap:
+        try:
+            new_conn = sqlite3.connect(db_path)
+            n = diff_mod.apply_diff(old_snap, new_conn)
+            new_conn.close()
+            log.info("Feed diff: %d trip warning(s) stored.", n)
+        except Exception as exc:
+            log.warning("Feed diff failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,6 @@
 data/
+!static/data/
+!static/data/*.geojson
 __pycache__/
 *.pyc
 *.pyo

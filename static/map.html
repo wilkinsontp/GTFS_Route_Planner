@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SEQ Live Map</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    body { overflow: hidden; }
+    #map { height: calc(100vh - 52px); }
+    #sidebar {
+      position: absolute; top: 62px; right: 10px; z-index: 500;
+      width: 300px; max-height: calc(100vh - 80px);
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; overflow-y: auto; padding: 1rem;
+    }
+    .alert-item { background: var(--surface2); border-left: 3px solid var(--warning);
+      border-radius: 4px; padding: 0.6rem; margin-bottom: 0.5rem; font-size: 0.8rem; }
+    .alert-header { font-weight: 600; color: var(--warning); margin-bottom: 0.25rem; }
+    .alert-routes { color: var(--muted); font-size: 0.75rem; }
+    .legend { background: var(--surface2); border-radius: 6px; padding: 0.75rem; margin-bottom: 1rem; }
+    .legend-item { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8rem; margin-bottom: 0.3rem; }
+    .legend-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+    .stat-row { display: flex; justify-content: space-between; font-size: 0.8rem; color: var(--muted); margin-bottom: 0.5rem; }
+    .stat-row span { color: var(--text); font-weight: 600; }
+  </style>
+</head>
+<body>
+
+<nav>
+  <span class="logo">SEQ Transit</span>
+  <a href="/">Journey</a>
+  <a href="/map.html" class="active">Live Map</a>
+  <a href="/analytics.html">Analytics</a>
+  <span class="rt-badge">
+    <span class="rt-dot" id="rtDot"></span>
+    <span id="rtAge">RT: —</span>
+  </span>
+</nav>
+
+<div id="map"></div>
+
+<div id="sidebar">
+  <div class="card-title">Live vehicles</div>
+  <div class="stat-row">Vehicles: <span id="vCount">—</span></div>
+  <div class="stat-row">Last update: <span id="vAge">—</span></div>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#4f8ef7"></div>Bus</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f97316"></div>Train</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#06b6d4"></div>Ferry</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#8b5cf6"></div>Tram</div>
+  </div>
+
+  <div class="card-title" style="margin-top:1rem">Service alerts (<span id="aCount">0</span>)</div>
+  <div id="alertList"><div style="color:var(--muted);font-size:.8rem">Loading…</div></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map = L.map('map').setView([-27.47, 153.02], 12);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '© OpenStreetMap contributors', maxZoom: 19
+}).addTo(map);
+
+const MODE_COLOR = { 3:'#4f8ef7', 2:'#f97316', 4:'#06b6d4', 0:'#8b5cf6', 1:'#f97316' };
+const MODE_LABEL = { 3:'Bus', 2:'Train', 4:'Ferry', 0:'Tram', 1:'Train' };
+
+let vehicleMarkers = {};
+
+function makeIcon(color) {
+  return L.divIcon({
+    className: '',
+    html: `<svg width="14" height="14" viewBox="0 0 14 14">
+      <circle cx="7" cy="7" r="6" fill="${color}" stroke="#0f1117" stroke-width="1.5"/>
+    </svg>`,
+    iconSize: [14, 14], iconAnchor: [7, 7]
+  });
+}
+
+async function updateVehicles() {
+  try {
+    const res = await fetch('/vehicles');
+    const data = await res.json();
+    document.getElementById('vCount').textContent = data.count;
+    document.getElementById('vAge').textContent = data.rt_age_seconds + 's ago';
+
+    // Remove stale markers
+    const fresh = new Set(data.vehicles.filter(v=>v.lat).map(v=>v.vehicle_id));
+    Object.keys(vehicleMarkers).forEach(id => {
+      if (!fresh.has(id)) { map.removeLayer(vehicleMarkers[id]); delete vehicleMarkers[id]; }
+    });
+
+    // Add/update markers
+    data.vehicles.forEach(v => {
+      if (!v.lat || !v.lon) return;
+      const color = MODE_COLOR[3]; // route_type not in vehicle payload; default to bus color
+      const popup = `<b>${v.vehicle_id || '?'}</b><br>Stop: ${v.stop_id||'—'}<br>Speed: ${v.speed ? Math.round(v.speed*3.6)+' km/h' : '—'}`;
+      if (vehicleMarkers[v.vehicle_id]) {
+        vehicleMarkers[v.vehicle_id].setLatLng([v.lat, v.lon]).setPopupContent(popup);
+      } else {
+        vehicleMarkers[v.vehicle_id] = L.marker([v.lat, v.lon], {icon: makeIcon(color)})
+          .bindPopup(popup).addTo(map);
+      }
+    });
+
+    updateRtBadge(data.rt_age_seconds);
+  } catch(e) { console.error('Vehicle update failed', e); }
+}
+
+async function updateAlerts() {
+  try {
+    const res = await fetch('/alerts');
+    const data = await res.json();
+    document.getElementById('aCount').textContent = data.count;
+    const list = document.getElementById('alertList');
+    if (!data.alerts.length) { list.innerHTML = '<div style="color:var(--muted);font-size:.8rem">No active alerts.</div>'; return; }
+    list.innerHTML = data.alerts.slice(0,15).map(a => `
+      <div class="alert-item">
+        <div class="alert-header">${a.header || 'Alert'}</div>
+        ${a.description ? `<div style="color:var(--muted);font-size:.75rem;margin-top:.2rem">${a.description.slice(0,120)}${a.description.length>120?'…':''}</div>` : ''}
+        ${a.informed_routes.length ? `<div class="alert-routes">Routes: ${a.informed_routes.slice(0,5).join(', ')}</div>` : ''}
+      </div>`).join('');
+  } catch(e) {}
+}
+
+function updateRtBadge(age) {
+  const dot = document.getElementById('rtDot');
+  document.getElementById('rtAge').textContent = `RT: ${age}s`;
+  dot.className = 'rt-dot' + (age > 120 ? ' stale' : '');
+}
+
+updateVehicles();
+updateAlerts();
+setInterval(updateVehicles, 30000);
+setInterval(updateAlerts,  60000);
+</script>
+</body>
+</html>

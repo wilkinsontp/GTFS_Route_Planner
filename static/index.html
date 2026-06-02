@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SEQ Transit Planner</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav>
+  <span class="logo">SEQ Transit</span>
+  <a href="/" class="active">Journey</a>
+  <a href="/map.html">Live Map</a>
+  <a href="/analytics.html">Analytics</a>
+  <span class="rt-badge">
+    <span class="rt-dot" id="rtDot"></span>
+    <span id="rtAge">RT: —</span>
+  </span>
+</nav>
+
+<div class="container">
+  <div class="two-col">
+
+    <!-- Search panel -->
+    <div class="card">
+      <div class="card-title">Plan a journey</div>
+
+      <div class="field">
+        <label>From</label>
+        <div class="autocomplete-wrap">
+          <input id="originInput" type="text" placeholder="Address or suburb…" autocomplete="off">
+          <ul class="suggestions" id="originSugg" style="display:none"></ul>
+        </div>
+        <input type="hidden" id="originLat"> <input type="hidden" id="originLon">
+      </div>
+
+      <div class="field">
+        <label>To</label>
+        <div class="autocomplete-wrap">
+          <input id="destInput" type="text" placeholder="Address or suburb…" autocomplete="off">
+          <ul class="suggestions" id="destSugg" style="display:none"></ul>
+        </div>
+        <input type="hidden" id="destLat"> <input type="hidden" id="destLon">
+      </div>
+
+      <div class="toggle-row">
+        <div class="toggle-btn active" id="toggleDepart" onclick="setMode('depart')">Depart after</div>
+        <div class="toggle-btn" id="toggleArrive" onclick="setMode('arrive')" title="Arrive-before not yet implemented">Arrive before</div>
+      </div>
+
+      <div class="field">
+        <label id="dtLabel">Depart after</label>
+        <input id="dtInput" type="datetime-local">
+      </div>
+
+      <div class="field">
+        <label>Stop search radius: <span id="radiusLabel">500</span> m</label>
+        <input id="radiusInput" type="range" min="100" max="1500" step="50" value="500"
+               oninput="document.getElementById('radiusLabel').textContent=this.value">
+      </div>
+
+      <button class="btn" onclick="planJourney()">Find journey</button>
+      <button class="btn secondary" style="margin-top:0.5rem" onclick="refreshJourney()" id="refreshBtn" disabled>
+        ↻ Refresh RT data
+      </button>
+    </div>
+
+    <!-- Results panel -->
+    <div id="results">
+      <div class="msg info">Enter origin and destination to find a journey.</div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const API = '';
+let mode = 'depart';
+let debounceTimer = null;
+
+// Set datetime default to now
+(function() {
+  const d = new Date();
+  d.setSeconds(0, 0);
+  document.getElementById('dtInput').value = d.toISOString().slice(0,16);
+})();
+
+function setMode(m) {
+  mode = m;
+  document.getElementById('toggleDepart').classList.toggle('active', m === 'depart');
+  document.getElementById('toggleArrive').classList.toggle('active', m === 'arrive');
+  document.getElementById('dtLabel').textContent = m === 'depart' ? 'Depart after' : 'Arrive before';
+}
+
+// ── Geocoding autocomplete ────────────────────────────────────────────────
+
+function setupAutocomplete(inputId, suggId, latId, lonId) {
+  const input = document.getElementById(inputId);
+  const sugg  = document.getElementById(suggId);
+
+  input.addEventListener('input', () => {
+    clearTimeout(debounceTimer);
+    document.getElementById(latId).value = '';
+    document.getElementById(lonId).value = '';
+    if (input.value.length < 3) { sugg.style.display = 'none'; return; }
+    debounceTimer = setTimeout(() => fetchSuggestions(input, sugg, latId, lonId), 400);
+  });
+
+  document.addEventListener('click', e => {
+    if (!input.contains(e.target) && !sugg.contains(e.target)) sugg.style.display = 'none';
+  });
+}
+
+async function fetchSuggestions(input, sugg, latId, lonId) {
+  try {
+    const res = await fetch(`${API}/geocode?q=${encodeURIComponent(input.value)}`);
+    const data = await res.json();
+    if (!data.length) { sugg.style.display = 'none'; return; }
+    sugg.innerHTML = '';
+    data.forEach(item => {
+      const li = document.createElement('li');
+      li.textContent = item.display_name;
+      li.onclick = () => {
+        input.value = item.display_name;
+        document.getElementById(latId).value = item.lat;
+        document.getElementById(lonId).value = item.lon;
+        sugg.style.display = 'none';
+      };
+      sugg.appendChild(li);
+    });
+    sugg.style.display = 'block';
+  } catch(e) { sugg.style.display = 'none'; }
+}
+
+setupAutocomplete('originInput', 'originSugg', 'originLat', 'originLon');
+setupAutocomplete('destInput',   'destSugg',   'destLat',   'destLon');
+
+// ── Journey planning ──────────────────────────────────────────────────────
+
+async function planJourney() {
+  const olat = document.getElementById('originLat').value;
+  const olon = document.getElementById('originLon').value;
+  const dlat = document.getElementById('destLat').value;
+  const dlon = document.getElementById('destLon').value;
+  const dt   = document.getElementById('dtInput').value;
+  const radius = document.getElementById('radiusInput').value;
+
+  if (!olat || !olon) { showError('Please select an origin from the suggestions.'); return; }
+  if (!dlat || !dlon) { showError('Please select a destination from the suggestions.'); return; }
+
+  showLoading();
+
+  try {
+    const body = { start_lat: +olat, start_lon: +olon, end_lat: +dlat, end_lon: +dlon,
+                   depart_after: dt, stop_search_radius_m: +radius };
+    const res = await fetch(`${API}/journey`, {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if (!res.ok) { showError(data.detail || 'Journey not found.'); return; }
+    renderJourney(data);
+    document.getElementById('refreshBtn').disabled = false;
+    updateRtBadge(data.rt_age_seconds);
+  } catch(e) { showError('Could not reach the planner API. Is the server running?'); }
+}
+
+async function refreshJourney() {
+  showLoading();
+  try {
+    const res = await fetch(`${API}/refresh`, { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) { showError(data.detail || 'Refresh failed.'); return; }
+    if (data.legs) { renderJourney(data); updateRtBadge(data.rt_age_seconds); }
+    else { document.getElementById('results').innerHTML = '<div class="msg info">RT data refreshed. Re-submit your query.</div>'; }
+  } catch(e) { showError('Refresh failed.'); }
+}
+
+// ── Rendering ─────────────────────────────────────────────────────────────
+
+const MODE_CLASS = { 3:'bus', 2:'train', 4:'ferry', 0:'tram', 1:'train', '-1':'walk' };
+const MODE_LABEL = { 3:'Bus', 2:'Train', 4:'Ferry', 0:'Tram', 1:'Metro', '-1':'Walk' };
+
+function modeClass(routeType) { return MODE_CLASS[routeType] || 'bus'; }
+
+function fmtTime(t, rtT) {
+  if (!t) return '';
+  let html = `<span>${t}</span>`;
+  if (rtT && rtT !== t) {
+    const [h1,m1] = t.split(':').map(Number);
+    const [h2,m2] = rtT.split(':').map(Number);
+    const diff = (h2*60+m2)-(h1*60+m1);
+    const cls  = diff > 0 ? 'rt' : 'early';
+    const sign = diff > 0 ? '+' : '';
+    html += ` <span class="${cls}">${sign}${diff}m (${rtT})</span>`;
+  }
+  return html;
+}
+
+function renderJourney(data) {
+  const board = data.legs.find(l => l.route_type !== -1);
+  const alight = [...data.legs].reverse().find(l => l.route_type !== -1);
+  let html = `
+    <div class="card" style="margin-bottom:1rem">
+      <div class="journey-meta">
+        <span>${data.origin_stop_name}</span> → <span>${data.destination_stop_name}</span><br>
+        <span>${data.total_minutes} min</span> · <span>${data.transfers} transfer${data.transfers!==1?'s':''}</span>
+        · RT data <span>${data.rt_age_seconds}s</span> old
+      </div>
+      <div class="timeline">`;
+
+  data.legs.forEach((leg, i) => {
+    const mc   = leg.route_type === -1 ? 'walk' : modeClass(leg.route_type);
+    const isLast = i === data.legs.length - 1;
+    const label  = leg.route_type === -1 ? 'Walk' : (leg.route_short_name || MODE_LABEL[leg.route_type]);
+
+    html += `<div class="leg">
+      <div class="leg-icon">
+        <div class="leg-dot ${mc}"></div>
+        ${!isLast ? `<div class="leg-line ${mc}"></div>` : ''}
+      </div>
+      <div class="leg-body">
+        <div class="leg-header">
+          <span class="leg-route ${mc}">${label}</span>
+          <span class="leg-stop">${leg.board_stop_name}</span>
+          <span class="leg-time">${fmtTime(leg.board_time, leg.rt_board_time)}</span>
+        </div>`;
+
+    if (leg.route_type === -1) {
+      html += `<div class="leg-sub">Walk ${leg.walk_distance_m ? Math.round(leg.walk_distance_m)+'m' : ''} · ~${Math.round((leg.alight_time ? parseTime(leg.alight_time)-parseTime(leg.board_time) : 0)/60)} min</div>`;
+    } else {
+      html += `<div class="leg-sub">${leg.route_long_name || ''}</div>`;
+    }
+
+    html += `<div class="leg-alight">
+        <span style="color:var(--muted);font-size:.78rem">→</span>
+        <span class="leg-stop" style="font-size:.85rem">${leg.alight_stop_name}</span>
+        <span class="leg-time">${fmtTime(leg.alight_time, leg.rt_alight_time)}</span>
+      </div>
+      </div></div>`;
+  });
+
+  html += `</div></div>`;  // close timeline + card
+
+  if (data.warnings && data.warnings.length) {
+    html += `<div class="warnings">`;
+    data.warnings.forEach(w => { html += `<div class="warning-item">⚠ ${w}</div>`; });
+    html += `</div>`;
+  }
+
+  document.getElementById('results').innerHTML = html;
+}
+
+function parseTime(t) {
+  const [h,m] = t.split(':').map(Number); return h*60+m;
+}
+
+function showLoading() {
+  document.getElementById('results').innerHTML =
+    '<div class="msg info"><span class="spinner"></span>Planning journey…</div>';
+}
+function showError(msg) {
+  document.getElementById('results').innerHTML = `<div class="msg error">✕ ${msg}</div>`;
+}
+
+// ── RT badge ─────────────────────────────────────────────────────────────
+
+function updateRtBadge(age) {
+  const dot = document.getElementById('rtDot');
+  const lbl = document.getElementById('rtAge');
+  lbl.textContent = `RT: ${age}s`;
+  dot.className = 'rt-dot' + (age > 120 ? ' stale' : age > 300 ? ' offline' : '');
+}
+
+async function pollRtAge() {
+  try {
+    const res = await fetch(`${API}/health`);
+    const d = await res.json();
+    updateRtBadge(d.rt_age_seconds);
+  } catch(e) {}
+}
+setInterval(pollRtAge, 30000);
+pollRtAge();
+</script>
+</body>
+</html>
