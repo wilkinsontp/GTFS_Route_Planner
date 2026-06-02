@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(py -m pip install requests --quiet)",
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "Bash(py ingester.py)",
+      "Bash(py -c ' *)",
+      "Bash(py -m pip install fastapi uvicorn[standard])",
+      "Bash(py -c \"import ast, pathlib; ast.parse\\(pathlib.Path\\('main.py'\\).read_text\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(py -m uvicorn main:app --host 127.0.0.1 --port 8000)",
+      "Bash(curl -s http://127.0.0.1:8000/health)",
+      "Bash(py -m json.tool)",
+      "Bash(py -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('legs=%d total=%dmin'%\\(len\\(d['legs']\\),d['total_minutes']\\)\\)\")",
+      "Bash(git add *)"
+    ]
+  }
+}

@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+gtfs-realtime-bindings
+requests
+geopandas
+shapely
+geopy
