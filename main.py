@@ -132,8 +132,13 @@ class JourneyRequest(BaseModel):
     end_lon: float = Field(..., description="Destination longitude (WGS-84)")
     depart_after: Optional[str] = Field(
         None,
-        description="ISO-8601 datetime (local), e.g. '2026-06-02T08:00'. "
-                    "Defaults to now if omitted.",
+        description="ISO-8601 datetime, e.g. '2026-06-02T08:00'. "
+                    "Mutually exclusive with arrive_before. Defaults to now.",
+    )
+    arrive_before: Optional[str] = Field(
+        None,
+        description="ISO-8601 datetime for arrive-by queries. "
+                    "Mutually exclusive with depart_after.",
     )
     stop_search_radius_m: float = Field(500.0, ge=50, le=2000)
 
@@ -202,7 +207,15 @@ def journey(req: JourneyRequest):
     _last_journey_req = req
     db = _get_db()
 
-    if req.depart_after:
+    # Resolve date and time constraint
+    arrive_sec: Optional[int] = None
+    depart_sec: Optional[int] = None
+
+    if req.arrive_before:
+        dt = datetime.fromisoformat(req.arrive_before)
+        journey_date = dt.date()
+        arrive_sec = dt.hour * 3600 + dt.minute * 60 + dt.second
+    elif req.depart_after:
         dt = datetime.fromisoformat(req.depart_after)
         journey_date = dt.date()
         depart_sec = dt.hour * 3600 + dt.minute * 60 + dt.second
@@ -214,33 +227,50 @@ def journey(req: JourneyRequest):
     conns, footpaths = _ensure_connections(journey_date)
 
     origin_stops = stops_near(req.start_lat, req.start_lon, db, req.stop_search_radius_m)
-    dest_stops = stops_near(req.end_lat, req.end_lon, db, req.stop_search_radius_m)
+    dest_stops   = stops_near(req.end_lat,   req.end_lon,   db, req.stop_search_radius_m)
 
     if not origin_stops:
         raise HTTPException(404, "No stops found near origin within search radius")
     if not dest_stops:
         raise HTTPException(404, "No stops found near destination within search radius")
 
-    # Try origin/dest combos; pick the one with the earliest arrival
+    # Try all origin/dest combos; pick the best result.
+    # For depart_after: minimise total_time (earliest arrival).
+    # For arrive_before: maximise departure time (leave as late as possible),
+    #   represented as minimise (arrive_before - board_time).
     journey_result: Optional[Journey] = None
     chosen_origin = origin_stops[0]
-    chosen_dest = dest_stops[0]
+    chosen_dest   = dest_stops[0]
 
     for orig in origin_stops:
         for dst in dest_stops:
-            j = plan_journey(orig[0], dst[0], depart_sec, conns, footpaths, db)
-            if j is not None:
-                if journey_result is None or j.total_time < journey_result.total_time:
-                    journey_result = j
-                    chosen_origin = orig
-                    chosen_dest = dst
+            j = plan_journey(
+                orig[0], dst[0], conns, footpaths, db,
+                depart_after=depart_sec,
+                arrive_before=arrive_sec,
+            )
+            if j is None:
+                continue
+            if journey_result is None:
+                journey_result, chosen_origin, chosen_dest = j, orig, dst
+            elif arrive_sec is not None:
+                # Latest departure wins
+                j_dep  = j.legs[0].board_time  if j.legs  else 0
+                best_dep = journey_result.legs[0].board_time if journey_result.legs else 0
+                if j_dep > best_dep:
+                    journey_result, chosen_origin, chosen_dest = j, orig, dst
+            else:
+                # Earliest arrival wins
+                if j.total_time < journey_result.total_time:
+                    journey_result, chosen_origin, chosen_dest = j, orig, dst
 
     if journey_result is None:
+        constraint = (f"arriving before {_fmt_time(arrive_sec)}"
+                      if arrive_sec else f"departing after {_fmt_time(depart_sec)}")
         raise HTTPException(
             404,
-            f"No journey found between the given coordinates for "
-            f"{journey_date} departing after {_fmt_time(depart_sec)}. "
-            "Try a later departure time or wider search radius.",
+            f"No journey found for {journey_date} {constraint}. "
+            "Try adjusting the time or widening the stop search radius.",
         )
 
     # Apply RT delays and collect warnings

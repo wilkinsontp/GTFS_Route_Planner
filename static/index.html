@@ -153,7 +153,9 @@ async function planJourney() {
 
   try {
     const body = { start_lat: +olat, start_lon: +olon, end_lat: +dlat, end_lon: +dlon,
-                   depart_after: dt, stop_search_radius_m: +radius };
+                   stop_search_radius_m: +radius };
+    if (mode === 'arrive') body.arrive_before = dt;
+    else body.depart_after = dt;
     const res = await fetch(`${API}/journey`, {
       method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
     });
