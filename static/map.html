@@ -69,14 +69,29 @@ const MODE_LABEL = { 3:'Bus', 2:'Train', 4:'Ferry', 0:'Tram', 1:'Train' };
 
 let vehicleMarkers = {};
 
-function makeIcon(color) {
+function makeIcon(color, size) {
+  const s = size || 12;
   return L.divIcon({
     className: '',
-    html: `<svg width="14" height="14" viewBox="0 0 14 14">
-      <circle cx="7" cy="7" r="6" fill="${color}" stroke="#0f1117" stroke-width="1.5"/>
+    html: `<svg width="${s}" height="${s}" viewBox="0 0 ${s} ${s}">
+      <circle cx="${s/2}" cy="${s/2}" r="${s/2-1.5}" fill="${color}" stroke="#0f1117" stroke-width="1.5"/>
     </svg>`,
-    iconSize: [14, 14], iconAnchor: [7, 7]
+    iconSize: [s, s], iconAnchor: [s/2, s/2]
   });
+}
+
+function vehiclePopup(v) {
+  const mode  = MODE_LABEL[v.route_type] || 'Vehicle';
+  const color = MODE_COLOR[v.route_type] || '#4f8ef7';
+  const route = v.route ? `<span style="background:${color};color:#fff;padding:1px 5px;border-radius:3px;font-weight:700;font-size:11px">${v.route}</span> ` : '';
+  const dir   = v.direction ? ` · ${v.direction}` : '';
+  const head  = v.headsign  ? `<br><span style="color:#94a3b8;font-size:11px">${v.headsign}</span>` : '';
+  const spd   = v.speed != null ? `${Math.round(v.speed * 3.6)} km/h` : '—';
+  const stop  = v.stop_id ? `Stop ${v.stop_id}` : '—';
+  return `<b>${route}${mode}${dir}</b>${head}
+    <br>ID: <code>${v.vehicle_id || '—'}</code>
+    <br>Current stop: ${stop}
+    <br>Speed: ${spd}`;
 }
 
 async function updateVehicles() {
@@ -92,15 +107,19 @@ async function updateVehicles() {
       if (!fresh.has(id)) { map.removeLayer(vehicleMarkers[id]); delete vehicleMarkers[id]; }
     });
 
-    // Add/update markers
+    // Add/update markers — size by mode (trains slightly larger)
     data.vehicles.forEach(v => {
       if (!v.lat || !v.lon) return;
-      const color = MODE_COLOR[3]; // route_type not in vehicle payload; default to bus color
-      const popup = `<b>${v.vehicle_id || '?'}</b><br>Stop: ${v.stop_id||'—'}<br>Speed: ${v.speed ? Math.round(v.speed*3.6)+' km/h' : '—'}`;
+      const color = MODE_COLOR[v.route_type] || '#4f8ef7';
+      const size  = (v.route_type === 2 || v.route_type === 1) ? 16 : 12; // trains bigger
+      const popup = vehiclePopup(v);
       if (vehicleMarkers[v.vehicle_id]) {
-        vehicleMarkers[v.vehicle_id].setLatLng([v.lat, v.lon]).setPopupContent(popup);
+        vehicleMarkers[v.vehicle_id]
+          .setLatLng([v.lat, v.lon])
+          .setIcon(makeIcon(color, size))
+          .setPopupContent(popup);
       } else {
-        vehicleMarkers[v.vehicle_id] = L.marker([v.lat, v.lon], {icon: makeIcon(color)})
+        vehicleMarkers[v.vehicle_id] = L.marker([v.lat, v.lon], {icon: makeIcon(color, size)})
           .bindPopup(popup).addTo(map);
       }
     });

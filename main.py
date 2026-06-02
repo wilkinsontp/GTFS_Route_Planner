@@ -24,6 +24,7 @@ from routing import (
     Connection, Footpaths, Journey, Leg,
     compute_footpaths, load_connections, plan_journey, stops_near,
 )
+import analytics as analytics_mod
 import diff as diff_mod
 from rt_merge import merge_rt
 from rt_store import start_rt_poller, store as rt_store
@@ -106,6 +107,9 @@ async def lifespan(app: FastAPI):
 
     # Start GTFS-RT background poller
     _rt_thread, _rt_stop = start_rt_poller(rt_store)
+
+    # Warm analytics cache in background (avoids 20 s delay on first /analytics request)
+    analytics_mod.warm_cache(_db_conn)
 
     yield
 
@@ -321,9 +325,42 @@ def alerts():
 @app.get("/vehicles")
 def vehicles():
     snap = rt_store.snapshot()
+    vp   = snap["vehicle_positions"]
+
+    enriched = []
+    if vp:
+        db = _get_db()
+        trip_ids = list(vp.keys())
+        ph = ",".join("?" * len(trip_ids))
+        rows = db.execute(
+            f"SELECT t.trip_id, r.route_short_name, r.route_type, "
+            f"       t.direction_id, t.trip_headsign "
+            f"FROM trips t JOIN routes r ON t.route_id = r.route_id "
+            f"WHERE t.trip_id IN ({ph})",
+            trip_ids,
+        ).fetchall()
+        trip_info = {r[0]: r for r in rows}
+
+        for trip_id, v in vp.items():
+            info = trip_info.get(trip_id)
+            if info:
+                _, route, route_type, direction_id, headsign = info
+                direction = (("Inbound" if direction_id == 1 else "Outbound")
+                             if direction_id is not None else None)
+            else:
+                route = route_type = direction = headsign = None
+            enriched.append({
+                **v,
+                "trip_id":    trip_id,
+                "route":      route,
+                "route_type": route_type,
+                "direction":  direction,
+                "headsign":   headsign,
+            })
+
     return {
-        "vehicles": list(snap["vehicle_positions"].values()),
-        "count": len(snap["vehicle_positions"]),
+        "vehicles": enriched,
+        "count": len(enriched),
         "rt_age_seconds": round(rt_store.age_seconds(), 1),
     }
 
@@ -356,21 +393,22 @@ def geocode(q: str = Query(..., min_length=3)):
 
 
 @app.get("/analytics/density")
-def analytics_density():
-    geojson_path = config.STATIC_DIR / "data" / "density.geojson"
-    if not geojson_path.exists():
-        raise HTTPException(404, "Density GeoJSON not yet generated. Run: py analytics.py")
-    import json
-    return json.loads(geojson_path.read_text())
+def analytics_density(
+    cell_deg: float = Query(0.01, ge=0.005, le=0.05,
+                            description="Grid cell size in degrees (~0.005°=550m … 0.05°=5.5km)"),
+):
+    db = _get_db()
+    return analytics_mod.compute_density(db, cell_deg=cell_deg)
 
 
 @app.get("/analytics/gaps")
-def analytics_gaps():
-    geojson_path = config.STATIC_DIR / "data" / "gaps.geojson"
-    if not geojson_path.exists():
-        raise HTTPException(404, "Gaps GeoJSON not yet generated. Run: py analytics.py")
-    import json
-    return json.loads(geojson_path.read_text())
+def analytics_gaps(
+    cell_deg: float   = Query(0.01,  ge=0.005, le=0.05),
+    gap_radius_m: float = Query(800.0, ge=200.0, le=3000.0,
+                                description="Cells with no stop within this radius are flagged"),
+):
+    db = _get_db()
+    return analytics_mod.compute_gaps(db, gap_radius_m=gap_radius_m, cell_deg=cell_deg)
 
 
 # ---------------------------------------------------------------------------

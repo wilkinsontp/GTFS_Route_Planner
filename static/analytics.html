@@ -12,7 +12,7 @@
     #controls {
       position: absolute; top: 62px; left: 10px; z-index: 500;
       background: var(--surface); border: 1px solid var(--border);
-      border-radius: 10px; padding: 1rem; width: 220px;
+      border-radius: 10px; padding: 1rem; width: 240px;
     }
     .layer-btn { display: block; width: 100%; margin-bottom: 0.5rem;
       padding: 0.5rem 0.75rem; border-radius: 6px; cursor: pointer; font-size: 0.85rem;
@@ -21,6 +21,10 @@
     .legend-scale { display: flex; height: 8px; border-radius: 4px; margin: 0.5rem 0; overflow:hidden; }
     .legend-labels { display: flex; justify-content: space-between; font-size: 0.7rem; color: var(--muted); }
     #statusMsg { font-size: 0.75rem; color: var(--muted); margin-top: 0.75rem; }
+    .slider-row { margin-top: 0.75rem; }
+    .slider-row label { display: flex; justify-content: space-between; font-size: 0.78rem; color: var(--muted); margin-bottom: 0.3rem; }
+    .slider-row label span { color: var(--text); font-weight: 600; }
+    .slider-row input[type=range] { width: 100%; accent-color: var(--accent); cursor: pointer; }
   </style>
 </head>
 <body>
@@ -49,6 +53,26 @@
     <div class="legend-labels"><span id="legendLow"></span><span id="legendHigh"></span></div>
   </div>
 
+  <!-- Cell size slider (both modes) -->
+  <div class="slider-row">
+    <label>Cell size <span id="cellLabel">~1.1 km</span></label>
+    <input type="range" id="cellSlider" min="1" max="9" step="1" value="2"
+           oninput="onCellChange(this.value)">
+    <div style="display:flex;justify-content:space-between;font-size:.68rem;color:var(--muted)">
+      <span>Fine</span><span>Coarse</span>
+    </div>
+  </div>
+
+  <!-- Gap radius slider (gaps mode only) -->
+  <div class="slider-row" id="gapSliderRow" style="display:none">
+    <label>Gap radius <span id="gapLabel">800 m</span></label>
+    <input type="range" id="gapSlider" min="200" max="2000" step="100" value="800"
+           oninput="onGapChange(this.value)">
+    <div style="display:flex;justify-content:space-between;font-size:.68rem;color:var(--muted)">
+      <span>200 m</span><span>2 km</span>
+    </div>
+  </div>
+
   <div id="statusMsg">Loading…</div>
 </div>
 
@@ -60,86 +84,100 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 }).addTo(map);
 
 let currentLayer = null;
-let activeMode = 'density';
+let activeMode   = 'density';
+let debounceTimer = null;
 
+// Cell size steps: slider 1-9 maps to these degree values
+const CELL_STEPS  = [0.005, 0.0075, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05];
+const CELL_LABELS = ['~550m','~830m','~1.1km','~1.7km','~2.2km','~2.8km','~3.3km','~4.4km','~5.5km'];
+
+function cellDeg()    { return CELL_STEPS[+document.getElementById('cellSlider').value - 1]; }
+function gapRadius()  { return +document.getElementById('gapSlider').value; }
+
+function onCellChange(v) {
+  document.getElementById('cellLabel').textContent = CELL_LABELS[+v - 1];
+  scheduleReload();
+}
+function onGapChange(v) {
+  document.getElementById('gapLabel').textContent = v + ' m';
+  scheduleReload();
+}
+function scheduleReload() {
+  clearTimeout(debounceTimer);
+  document.getElementById('statusMsg').textContent = 'Computing…';
+  debounceTimer = setTimeout(() => showLayer(activeMode), 400);
+}
+
+// ── Colour ramp (black → blue → cyan → yellow → red) ─────────────────────
 function lerp(a, b, t) { return a + (b - a) * t; }
 function toHex(r, g, b) {
-  return '#' + [r,g,b].map(x => Math.round(x).toString(16).padStart(2,'0')).join('');
+  return '#' + [r,g,b].map(x => Math.round(Math.max(0,Math.min(255,x))).toString(16).padStart(2,'0')).join('');
+}
+function densityColor(t) {
+  if (t < 0.25) { const s=t/0.25;       return toHex(lerp(15,0,s),  lerp(17,100,s), lerp(23,220,s)); }
+  if (t < 0.5)  { const s=(t-.25)/.25;  return toHex(0,             lerp(100,220,s),lerp(220,180,s)); }
+  if (t < 0.75) { const s=(t-.5)/.25;   return toHex(lerp(0,255,s), lerp(220,220,s),lerp(180,0,s)); }
+                  { const s=(t-.75)/.25; return toHex(lerp(255,220,s),lerp(220,30,s),0); }
 }
 
-function densityColor(intensity) {
-  // Black → blue → cyan → yellow → red
-  if (intensity < 0.25) {
-    const t = intensity / 0.25;
-    return toHex(lerp(15,0,t), lerp(17,100,t), lerp(23,220,t));
-  } else if (intensity < 0.5) {
-    const t = (intensity-0.25)/0.25;
-    return toHex(lerp(0,0,t), lerp(100,220,t), lerp(220,180,t));
-  } else if (intensity < 0.75) {
-    const t = (intensity-0.5)/0.25;
-    return toHex(lerp(0,255,t), lerp(220,220,t), lerp(180,0,t));
-  } else {
-    const t = (intensity-0.75)/0.25;
-    return toHex(lerp(255,220,t), lerp(220,30,t), lerp(0,0,t));
-  }
-}
-
+// ── Layer rendering ───────────────────────────────────────────────────────
 async function showLayer(mode) {
   activeMode = mode;
   document.getElementById('btnDensity').classList.toggle('active', mode==='density');
   document.getElementById('btnGaps').classList.toggle('active', mode==='gaps');
+  document.getElementById('gapSliderRow').style.display = mode==='gaps' ? 'block' : 'none';
 
   if (currentLayer) { map.removeLayer(currentLayer); currentLayer = null; }
   document.getElementById('statusMsg').textContent = 'Loading…';
 
-  const endpoint = mode === 'density' ? '/analytics/density' : '/analytics/gaps';
+  const cd = cellDeg();
+  const url = mode === 'density'
+    ? `/analytics/density?cell_deg=${cd}`
+    : `/analytics/gaps?cell_deg=${cd}&gap_radius_m=${gapRadius()}`;
+
   try {
-    const res = await fetch(endpoint);
-    if (!res.ok) { document.getElementById('statusMsg').textContent = await res.text(); return; }
+    const res = await fetch(url);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({detail: res.statusText}));
+      document.getElementById('statusMsg').textContent = err.detail || 'Error';
+      return;
+    }
     const geojson = await res.json();
 
     if (mode === 'density') {
       currentLayer = L.geoJSON(geojson, {
-        style: f => ({
-          fillColor: densityColor(f.properties.intensity),
-          fillOpacity: 0.7,
-          color: 'none', weight: 0,
-        }),
-        onEachFeature: (f, layer) => {
-          layer.bindTooltip(`${f.properties.count.toLocaleString()} departures`);
-        }
+        style: f => ({ fillColor: densityColor(f.properties.intensity),
+                        fillOpacity: 0.75, color: 'none', weight: 0 }),
+        onEachFeature: (f, layer) =>
+          layer.bindTooltip(`${f.properties.count.toLocaleString()} departures`),
       }).addTo(map);
 
-      // Legend
-      const stops = 12;
+      const n = 12;
       document.getElementById('legendScale').innerHTML =
-        Array.from({length:stops}, (_,i) =>
-          `<div style="flex:1;background:${densityColor(i/(stops-1))}"></div>`).join('');
-      document.getElementById('legendLow').textContent  = 'Low';
-      document.getElementById('legendHigh').textContent = 'High';
+        Array.from({length:n}, (_,i) =>
+          `<div style="flex:1;background:${densityColor(i/(n-1))}"></div>`).join('');
+      document.getElementById('legendLow').textContent  = 'Low frequency';
+      document.getElementById('legendHigh').textContent = 'High frequency';
     } else {
       currentLayer = L.geoJSON(geojson, {
-        style: f => ({
-          fillColor: '#ef4444', fillOpacity: 0.35,
-          color: 'none', weight: 0,
-        }),
+        style: f => ({ fillColor:'#ef4444', fillOpacity:0.4, color:'none', weight:0 }),
         onEachFeature: (f, layer) => {
           const d = f.properties.nearest_stop_m;
-          layer.bindTooltip(d ? `${Math.round(d)}m to nearest stop` : 'No stop found');
-        }
+          layer.bindTooltip(d ? `${Math.round(d).toLocaleString()} m to nearest stop` : 'No stop nearby');
+        },
       }).addTo(map);
 
       document.getElementById('legendScale').innerHTML =
-        `<div style="flex:1;background:#ef4444;opacity:.35"></div>`;
-      document.getElementById('legendLow').textContent  = 'No stop within 800m';
+        `<div style="flex:1;background:#ef4444;opacity:.4;border-radius:4px"></div>`;
+      document.getElementById('legendLow').textContent  = `No stop within ${gapRadius()} m`;
       document.getElementById('legendHigh').textContent = '';
     }
 
-    const count = geojson.features.length;
     document.getElementById('statusMsg').textContent =
-      `${count.toLocaleString()} cells displayed`;
+      `${geojson.features.length.toLocaleString()} cells · ${CELL_LABELS[+document.getElementById('cellSlider').value-1]} grid`;
   } catch(e) {
     document.getElementById('statusMsg').textContent = 'Failed to load overlay.';
+    console.error(e);
   }
 }
 
