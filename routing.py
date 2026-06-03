@@ -294,6 +294,120 @@ def _backtrack(
     return path
 
 
+# ---------------------------------------------------------------------------
+# Reverse CSA — latest-departure / arrive-before queries
+# ---------------------------------------------------------------------------
+
+_NINF = -(10**9)
+
+
+def _csa_reverse(
+    connections: list[Connection],
+    footpaths: Footpaths,
+    origin: str,
+    destination: str,
+    arrive_before: int,
+    min_transfer_s: int = config.MIN_TRANSFER_SECONDS,
+) -> dict[str, Connection]:
+    """Reverse CSA: find the latest-departure journey arriving by arrive_before.
+
+    Scans connections in descending departure-time order and tracks the latest
+    time you can depart from each stop while still reaching the destination in
+    time.  Mirror of _csa_raw; footpath and transfer rules are symmetric.
+
+    Returns out_connection: {dep_stop -> Connection to board from that stop}.
+    Follow out_connection[origin] → out_connection[c.arr_stop] → … to reconstruct.
+    """
+    # latest_dep[s] = latest you may DEPART from s and still reach destination
+    latest_dep: dict[str, int] = {destination: arrive_before}
+    out_connection: dict[str, Connection] = {}   # dep_stop -> connection
+    boarded_trip: set[str] = set()
+
+    # Propagate backward footpaths from destination: if you can walk from
+    # nearby_stop to destination in walk_s seconds, you need to leave
+    # nearby_stop by (arrive_before - walk_s).
+    for nearby_stop, walk_s, dist_m in footpaths.get(destination, []):
+        t = arrive_before - walk_s
+        if t > latest_dep.get(nearby_stop, _NINF):
+            latest_dep[nearby_stop] = t
+            out_connection[nearby_stop] = Connection(
+                dep_time=t, arr_time=arrive_before,
+                dep_stop=nearby_stop, arr_stop=destination,
+                trip_id=WALK_TRIP_ID,
+            )
+
+    # Scan only connections whose departure is at or before arrive_before
+    cutoff_idx = bisect.bisect_right(
+        connections, Connection(arrive_before, arrive_before, "\xff", "\xff", "\xff")
+    )
+
+    for c in reversed(connections[:cutoff_idx]):
+        # --- Can we alight from this connection and still reach destination? ---
+        if c.trip_id in boarded_trip:
+            # Trip already confirmed useful at a later stop — continue backwards
+            can_use = True
+        else:
+            next_leg_via_transit = (
+                c.arr_stop in out_connection
+                and out_connection[c.arr_stop].trip_id != WALK_TRIP_ID
+            )
+            if next_leg_via_transit:
+                # Transfer at arr_stop: must wait min_transfer_s before next departure
+                can_use = c.arr_time + min_transfer_s <= latest_dep.get(c.arr_stop, _NINF)
+            else:
+                # Destination, walked-from stop, or not yet reached
+                can_use = c.arr_time <= latest_dep.get(c.arr_stop, _NINF)
+
+        if not can_use:
+            continue
+
+        # Keep the LATEST departure from dep_stop (we scan descending, so
+        # the first time we reach dep_stop gives the latest valid departure)
+        if c.dep_time <= latest_dep.get(c.dep_stop, _NINF):
+            continue
+
+        latest_dep[c.dep_stop] = c.dep_time
+        out_connection[c.dep_stop] = c
+        boarded_trip.add(c.trip_id)
+
+        # Propagate backward footpaths from dep_stop: walk from nearby_stop
+        # arriving at dep_stop just in time to board c.
+        for nearby_stop, walk_s, dist_m in footpaths.get(c.dep_stop, []):
+            t = c.dep_time - walk_s
+            if t > latest_dep.get(nearby_stop, _NINF):
+                latest_dep[nearby_stop] = t
+                out_connection[nearby_stop] = Connection(
+                    dep_time=t, arr_time=c.dep_time,
+                    dep_stop=nearby_stop, arr_stop=c.dep_stop,
+                    trip_id=WALK_TRIP_ID,
+                )
+
+    return out_connection
+
+
+def _backtrack_reverse(
+    out_connection: dict[str, Connection],
+    origin: str,
+    destination: str,
+) -> Optional[list[Connection]]:
+    """Follow out_connection forward from origin to destination."""
+    if origin not in out_connection:
+        return None
+    path: list[Connection] = []
+    stop = origin
+    seen: set[str] = set()
+    while stop != destination:
+        if stop in seen:
+            return None
+        seen.add(stop)
+        if stop not in out_connection:
+            return None
+        c = out_connection[stop]
+        path.append(c)
+        stop = c.arr_stop
+    return path
+
+
 def _connections_to_legs(
     path: list[Connection],
     conn: sqlite3.Connection,
@@ -426,21 +540,31 @@ def stops_near(
 def plan_journey(
     origin_stop: str,
     dest_stop: str,
-    depart_after: int,
     connections: list[Connection],
     footpaths: Footpaths,
     conn: sqlite3.Connection,
+    *,
+    depart_after: Optional[int] = None,
+    arrive_before: Optional[int] = None,
 ) -> Optional[Journey]:
-    """Find the earliest-arrival journey from origin_stop to dest_stop.
+    """Find the optimal journey between two stops.
 
-    `connections` is the pre-loaded sorted list for today.
-    `footpaths` is the pre-computed inter-stop walking table.
+    Exactly one of depart_after or arrive_before must be provided:
+    - depart_after: earliest-arrival search (forward CSA)
+    - arrive_before: latest-departure search (reverse CSA)
     """
     if origin_stop == dest_stop:
         return Journey(legs=[], total_time=0, transfers=0)
 
-    in_conn = _csa_raw(connections, footpaths, origin_stop, dest_stop, depart_after)
-    path = _backtrack(in_conn, origin_stop, dest_stop)
+    if arrive_before is not None:
+        out_conn = _csa_reverse(connections, footpaths, origin_stop, dest_stop, arrive_before)
+        path = _backtrack_reverse(out_conn, origin_stop, dest_stop)
+    else:
+        if depart_after is None:
+            raise ValueError("Either depart_after or arrive_before must be provided")
+        in_conn = _csa_raw(connections, footpaths, origin_stop, dest_stop, depart_after)
+        path = _backtrack(in_conn, origin_stop, dest_stop)
+
     if path is None:
         return None
 
